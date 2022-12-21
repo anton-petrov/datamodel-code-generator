@@ -4,6 +4,8 @@
 Main function.
 """
 
+from __future__ import annotations
+
 import json
 import locale
 import signal
@@ -26,6 +28,7 @@ from typing import (
     cast,
 )
 from urllib.parse import ParseResult, urlparse
+from warnings import warn
 
 import argcomplete
 import black
@@ -146,6 +149,13 @@ arg_parser.add_argument(
     action='store_true',
     default=None,
 )
+
+arg_parser.add_argument(
+    '--original-field-name-delimiter',
+    help='Set delimiter to convert to snake case. This option only can be used with --snake-case-field (default: `_` )',
+    default=None,
+)
+
 arg_parser.add_argument(
     '--strip-default-none',
     help='Strip default None on fields',
@@ -221,10 +231,23 @@ arg_parser.add_argument(
     action='store_true',
     default=None,
 )
+arg_parser.add_argument(
+    '--use-union-operator',
+    help='Use | operator for Union type (PEP 604).',
+    action='store_true',
+    default=None,
+)
 
 arg_parser.add_argument(
     '--use-schema-description',
     help='Use schema description to populate class docstring',
+    action='store_true',
+    default=None,
+)
+
+arg_parser.add_argument(
+    '--use-field-description',
+    help='Use schema description to populate field docstring',
     action='store_true',
     default=None,
 )
@@ -258,6 +281,12 @@ arg_parser.add_argument(
     default=None,
 )
 
+arg_parser.add_argument(
+    '--use-subclass-enum',
+    help='Define Enum class as subclass with field type when enum has type (int, float, bytes, str)',
+    action='store_true',
+    default=False,
+)
 
 arg_parser.add_argument(
     '--class-name',
@@ -297,6 +326,14 @@ arg_parser.add_argument(
     help='Enable validation (Only OpenAPI)',
     action='store_true',
     default=None,
+)
+
+arg_parser.add_argument(
+    "--use-double-quotes",
+    action='store_true',
+    default=False,
+    help="Model generated with double quotes. Single quotes or "
+    "your black config skip_string_normalization value will be used without this option.",
 )
 
 arg_parser.add_argument(
@@ -352,6 +389,17 @@ class Config(BaseModel):
                 )
         return values
 
+    @root_validator
+    def validate_original_field_name_delimiter(
+        cls, values: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if values.get('original_field_name_delimiter') is not None:
+            if not values.get('snake_case_field'):
+                raise Error(
+                    "`--original-field-name-delimiter` can not be used without `--snake-case-field`."
+                )
+        return values
+
     # Pydantic 1.5.1 doesn't support each_item=True correctly
     @validator('http_headers', pre=True)
     def validate_http_headers(cls, value: Any) -> Optional[List[Tuple[str, str]]]:
@@ -372,12 +420,27 @@ class Config(BaseModel):
 
     @root_validator()
     def validate_root(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        return cls._validate_use_annotated(values)
+        values = cls._validate_use_annotated(values)
+        return cls._validate_use_union_operator(values)
 
     @classmethod
     def _validate_use_annotated(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         if values.get('use_annotated'):
             values['field_constraints'] = True
+        return values
+
+    @classmethod
+    def _validate_use_union_operator(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        if values.get('use_union_operator'):
+            target_python_version: PythonVersion = values.get(
+                'target_python_version', PythonVersion.PY_37
+            )
+            if not target_python_version.has_union_operator:
+                warn(
+                    f"`--use-union-operator` can not be used with `--target-python_version` {target_python_version.value}.\n"
+                    f"`--target-python_version` {PythonVersion.PY_310.value} will be used."
+                )
+                values['target_python_version'] = PythonVersion.PY_310
         return values
 
     input: Optional[Union[Path, str]]
@@ -400,12 +463,15 @@ class Config(BaseModel):
     class_name: Optional[str] = None
     use_standard_collections: bool = False
     use_schema_description: bool = False
+    use_field_description: bool = False
     reuse_model: bool = False
     encoding: str = 'utf-8'
     enum_field_as_literal: Optional[LiteralType] = None
     set_default_enum_member: bool = False
+    use_subclass_enum: bool = False
     strict_nullable: bool = False
     use_generic_container_types: bool = False
+    use_union_operator: bool = False
     enable_faux_immutability: bool = False
     url: Optional[ParseResult] = None
     disable_appending_item_suffix: bool = False
@@ -420,12 +486,15 @@ class Config(BaseModel):
     http_ignore_tls: bool = False
     use_annotated: bool = False
     use_non_positive_negative_number_constrained_types: bool = False
+    original_field_name_delimiter: Optional[str] = None
+    use_double_quotes: bool = False
 
     def merge_args(self, args: Namespace) -> None:
         set_args = {
             f: getattr(args, f) for f in self.__fields__ if getattr(args, f) is not None
         }
         set_args = self._validate_use_annotated(set_args)
+        set_args = self._validate_use_union_operator(set_args)
         parsed_args = self.parse_obj(set_args)
         for field_name in set_args:
             setattr(self, field_name, getattr(parsed_args, field_name))
@@ -466,6 +535,14 @@ def main(args: Optional[Sequence[str]] = None) -> Exit:
         config.merge_args(namespace)
     except Error as e:
         print(e.message, file=sys.stderr)
+        return Exit.ERROR
+
+    if not config.input and not config.url and sys.stdin.isatty():
+        print(
+            'Not Found Input: require `stdin` or arguments `--input` or `--url`',
+            file=sys.stderr,
+        )
+        arg_parser.print_help()
         return Exit.ERROR
 
     if not is_supported_in_black(config.target_python_version):  # pragma: no cover
@@ -532,10 +609,12 @@ def main(args: Optional[Sequence[str]] = None) -> Exit:
             class_name=config.class_name,
             use_standard_collections=config.use_standard_collections,
             use_schema_description=config.use_schema_description,
+            use_field_description=config.use_field_description,
             reuse_model=config.reuse_model,
             encoding=config.encoding,
             enum_field_as_literal=config.enum_field_as_literal,
             set_default_enum_member=config.set_default_enum_member,
+            use_subclass_enum=config.use_subclass_enum,
             strict_nullable=config.strict_nullable,
             use_generic_container_types=config.use_generic_container_types,
             enable_faux_immutability=config.enable_faux_immutability,
@@ -551,6 +630,9 @@ def main(args: Optional[Sequence[str]] = None) -> Exit:
             http_ignore_tls=config.http_ignore_tls,
             use_annotated=config.use_annotated,
             use_non_positive_negative_number_constrained_types=config.use_non_positive_negative_number_constrained_types,
+            original_field_name_delimiter=config.original_field_name_delimiter,
+            use_double_quotes=config.use_double_quotes,
+            use_union_operator=config.use_union_operator,
         )
         return Exit.OK
     except InvalidClassNameError as e:

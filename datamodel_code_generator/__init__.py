@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import os
 from datetime import datetime, timezone
@@ -168,6 +170,7 @@ RAW_DATA_TYPES: List[InputFileType] = [
 class OpenAPIScope(Enum):
     Schemas = 'schemas'
     Paths = 'paths'
+    Tags = 'tags'
 
 
 class Error(Exception):
@@ -217,10 +220,12 @@ def generate(
     class_name: Optional[str] = None,
     use_standard_collections: bool = False,
     use_schema_description: bool = False,
+    use_field_description: bool = False,
     reuse_model: bool = False,
     encoding: str = 'utf-8',
     enum_field_as_literal: Optional[LiteralType] = None,
     set_default_enum_member: bool = False,
+    use_subclass_enum: bool = False,
     strict_nullable: bool = False,
     use_generic_container_types: bool = False,
     enable_faux_immutability: bool = False,
@@ -237,6 +242,9 @@ def generate(
     http_ignore_tls: bool = False,
     use_annotated: bool = False,
     use_non_positive_negative_number_constrained_types: bool = False,
+    original_field_name_delimiter: Optional[str] = None,
+    use_double_quotes: bool = False,
+    use_union_operator: bool = False,
 ) -> None:
     remote_text_cache: DefaultPutDict[str, str] = DefaultPutDict()
     if isinstance(input_, str):
@@ -337,9 +345,11 @@ def generate(
         if isinstance(input_, Path) and input_.is_file()
         else None,
         use_schema_description=use_schema_description,
+        use_field_description=use_field_description,
         reuse_model=reuse_model,
         enum_field_as_literal=enum_field_as_literal,
         set_default_enum_member=set_default_enum_member,
+        use_subclass_enum=use_subclass_enum,
         strict_nullable=strict_nullable,
         use_generic_container_types=use_generic_container_types,
         enable_faux_immutability=enable_faux_immutability,
@@ -356,6 +366,9 @@ def generate(
         http_ignore_tls=http_ignore_tls,
         use_annotated=use_annotated,
         use_non_positive_negative_number_constrained_types=use_non_positive_negative_number_constrained_types,
+        original_field_name_delimiter=original_field_name_delimiter,
+        use_double_quotes=use_double_quotes,
+        use_union_operator=use_union_operator,
         **kwargs,
     )
 

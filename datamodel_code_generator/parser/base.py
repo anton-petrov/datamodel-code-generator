@@ -29,6 +29,7 @@ from datamodel_code_generator.imports import IMPORT_ANNOTATIONS, Import, Imports
 from datamodel_code_generator.model import pydantic as pydantic_model
 from datamodel_code_generator.model.base import (
     ALL_MODEL,
+    UNDEFINED,
     BaseClassDataType,
     DataModel,
     DataModelFieldBase,
@@ -36,7 +37,12 @@ from datamodel_code_generator.model.base import (
 from datamodel_code_generator.model.enum import Enum
 from datamodel_code_generator.parser import DefaultPutDict, LiteralType
 from datamodel_code_generator.reference import ModelResolver, Reference
-from datamodel_code_generator.types import DataType, DataTypeManager, StrictTypes
+from datamodel_code_generator.types import (
+    DataType,
+    DataTypeManager,
+    Modular,
+    StrictTypes,
+)
 
 escape_characters = str.maketrans(
     {
@@ -159,6 +165,16 @@ def sort_data_models(
             unresolved_model = (
                 model.reference_classes - {model.path} - set(sorted_data_models)
             )
+            base_models = [
+                getattr(s.reference, "path", None) for s in model.base_classes
+            ]
+            update_action_parent = set(require_update_action_models).intersection(
+                base_models
+            )
+            if not unresolved_model and update_action_parent:
+                sorted_data_models[model.path] = model
+                require_update_action_models.append(model.path)
+                continue
             if not unresolved_model:
                 sorted_data_models[model.path] = model
                 continue
@@ -266,10 +282,12 @@ class Parser(ABC):
         use_standard_collections: bool = False,
         base_path: Optional[Path] = None,
         use_schema_description: bool = False,
+        use_field_description: bool = False,
         reuse_model: bool = False,
         encoding: str = 'utf-8',
         enum_field_as_literal: Optional[LiteralType] = None,
         set_default_enum_member: bool = False,
+        use_subclass_enum: bool = False,
         strict_nullable: bool = False,
         use_generic_container_types: bool = False,
         enable_faux_immutability: bool = False,
@@ -288,12 +306,17 @@ class Parser(ABC):
         http_ignore_tls: bool = False,
         use_annotated: bool = False,
         use_non_positive_negative_number_constrained_types: bool = False,
+        original_field_name_delimiter: Optional[str] = None,
+        use_double_quotes: bool = False,
+        use_union_operator: bool = False,
+        allow_responses_without_content: bool = False,
     ):
         self.data_type_manager: DataTypeManager = data_type_manager_type(
-            target_python_version,
-            use_standard_collections,
-            use_generic_container_types,
-            strict_types,
+            python_version=target_python_version,
+            use_standard_collections=use_standard_collections,
+            use_generic_container_types=use_generic_container_types,
+            strict_types=strict_types,
+            use_union_operator=use_union_operator,
         )
         self.data_model_type: Type[DataModel] = data_model_type
         self.data_model_root_type: Type[DataModel] = data_model_root_type
@@ -316,12 +339,15 @@ class Parser(ABC):
             force_optional_for_required_fields
         )
         self.use_schema_description: bool = use_schema_description
+        self.use_field_description: bool = use_field_description
         self.reuse_model: bool = reuse_model
         self.encoding: str = encoding
         self.enum_field_as_literal: Optional[LiteralType] = enum_field_as_literal
         self.set_default_enum_member: bool = set_default_enum_member
+        self.use_subclass_enum: bool = use_subclass_enum
         self.strict_nullable: bool = strict_nullable
         self.use_generic_container_types: bool = use_generic_container_types
+        self.use_union_operator: bool = use_union_operator
         self.enable_faux_immutability: bool = enable_faux_immutability
         self.custom_class_name_generator: Optional[
             Callable[[str], str]
@@ -364,6 +390,7 @@ class Parser(ABC):
             snake_case_field=snake_case_field,
             custom_class_name_generator=custom_class_name_generator,
             base_path=self.base_path,
+            original_field_name_delimiter=original_field_name_delimiter,
         )
         self.class_name: Optional[str] = class_name
         self.wrap_string_literal: Optional[bool] = wrap_string_literal
@@ -377,6 +404,8 @@ class Parser(ABC):
         self.use_non_positive_negative_number_constrained_types = (
             use_non_positive_negative_number_constrained_types
         )
+        self.use_double_quotes = use_double_quotes
+        self.allow_responses_without_content = allow_responses_without_content
 
     @property
     def iter_source(self) -> Iterator[Source]:
@@ -440,7 +469,10 @@ class Parser(ABC):
 
         if format_:
             code_formatter: Optional[CodeFormatter] = CodeFormatter(
-                self.target_python_version, settings_path, self.wrap_string_literal
+                self.target_python_version,
+                settings_path,
+                self.wrap_string_literal,
+                skip_string_normalization=not self.use_double_quotes,
             )
         else:
             code_formatter = None
@@ -568,7 +600,7 @@ class Parser(ABC):
                         data_type.alias = f'{alias}.{name}'
 
                     if init:
-                        from_ += "."
+                        from_ = "." + from_
                     imports.append(Import(from_=from_, import_=import_, alias=alias))
 
             # extract inherited enum
@@ -592,6 +624,18 @@ class Parser(ABC):
                         ),
                     )
                     models.remove(model)
+
+            for model in models:
+                for model_field in model.fields:
+                    if not model_field.data_type.reference or model_field.has_default:
+                        continue
+                    if isinstance(
+                        model_field.data_type.reference.source, DataModel
+                    ):  # pragma: no cover
+                        if model_field.data_type.reference.source.default != UNDEFINED:
+                            model_field.default = (
+                                model_field.data_type.reference.source.default
+                            )
 
             if self.reuse_model:
                 model_cache: Dict[Tuple[str, ...], Reference] = {}
@@ -656,6 +700,34 @@ class Parser(ABC):
                                 )
                                 if enum_member:
                                     model_field.default = enum_member
+                                    enum_member_enum = enum_member.enum
+                                    if enum_member_enum in models:
+                                        continue
+                                    scoped_model_resolver.get(enum_member_enum.path)
+                                    if isinstance(enum_member_enum, Modular):
+                                        enum_member_enum_name = f'{enum_member_enum.module_name}.{enum_member.enum.name}'
+                                    else:
+                                        enum_member_enum_name = enum_member.enum.name
+                                    from_, import_ = full_path = relative(
+                                        model.module_name, enum_member_enum_name
+                                    )
+
+                                    alias = scoped_model_resolver.add(
+                                        full_path, import_
+                                    ).name
+
+                                    name = data_type.reference.short_name
+                                    if from_ and import_ and alias != name:
+                                        enum_member.alias = f'{alias}.{name}'
+
+                                    if init:
+                                        from_ += "."
+                                    imports.append(
+                                        Import(
+                                            from_=from_, import_=import_, alias=alias
+                                        )
+                                    )
+
             if with_import:
                 result += [str(self.imports), str(imports), '\n']
 

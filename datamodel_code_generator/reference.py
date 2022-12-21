@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from collections import defaultdict
 from contextlib import contextmanager
@@ -27,6 +29,8 @@ from typing import (
 )
 
 import inflect
+import pydantic
+from packaging import version
 from pydantic import BaseModel, validator
 
 from datamodel_code_generator import cached_property
@@ -50,14 +54,14 @@ class _BaseModel(BaseModel):
     def dict(
         self,
         *,
-        include: Union['AbstractSetIntStr', 'MappingIntStrAny'] = None,
-        exclude: Union['AbstractSetIntStr', 'MappingIntStrAny'] = None,
+        include: Union[AbstractSetIntStr, MappingIntStrAny] = None,
+        exclude: Union[AbstractSetIntStr, MappingIntStrAny] = None,
         by_alias: bool = False,
         skip_defaults: bool = None,
         exclude_unset: bool = False,
         exclude_defaults: bool = False,
         exclude_none: bool = False,
-    ) -> 'DictStrAny':
+    ) -> DictStrAny:
         return super().dict(
             include=include,
             exclude=set(exclude or ()) | self._exclude_fields,
@@ -76,7 +80,7 @@ class Reference(_BaseModel):
     loaded: bool = True
     source: Optional[Any] = None
     children: List[Any] = []
-    _exclude_fields: ClassVar = {'children'}
+    _exclude_fields: ClassVar[Set[str]] = {'children'}
 
     @validator('original_name')
     def validate_original_name(cls, v: Any, values: Dict[str, Any]) -> str:
@@ -90,6 +94,11 @@ class Reference(_BaseModel):
     class Config:
         arbitrary_types_allowed = True
         keep_untouched = (cached_property,)
+        copy_on_model_validation = (
+            False
+            if version.parse(pydantic.VERSION) < version.parse('1.9.2')
+            else 'none'
+        )
 
     @property
     def short_name(self) -> str:
@@ -131,10 +140,12 @@ class FieldNameResolver:
         aliases: Optional[Mapping[str, str]] = None,
         snake_case_field: bool = False,
         empty_field_name: Optional[str] = None,
+        original_delimiter: Optional[str] = None,
     ):
         self.aliases: Mapping[str, str] = {} if aliases is None else {**aliases}
         self.empty_field_name: str = empty_field_name or '_'
         self.snake_case_field = snake_case_field
+        self.original_delimiter: Optional[str] = original_delimiter
 
     @classmethod
     def _validate_field_name(cls, field_name: str) -> bool:
@@ -144,25 +155,37 @@ class FieldNameResolver:
         self,
         name: str,
         excludes: Optional[Set[str]] = None,
+        ignore_snake_case_field: bool = False,
+        upper_camel: bool = False,
     ) -> str:
         if not name:
             name = self.empty_field_name
         if name[0] == '#':
             name = name[1:] or self.empty_field_name
+
+        if (
+            self.snake_case_field
+            and not ignore_snake_case_field
+            and self.original_delimiter is not None
+        ):
+            name = snake_to_upper_camel(name, delimiter=self.original_delimiter)
+
         # TODO: when first character is a number
-        name = re.sub(r'\W', '_', name)
+        name = re.sub(r'[¹²³⁴⁵⁶⁷⁸⁹]|\W', '_', name)
         if name[0].isnumeric():
             name = f'field_{name}'
-        if self.snake_case_field:
+        if self.snake_case_field and not ignore_snake_case_field:
             name = camel_to_snake(name)
         count = 1
         if iskeyword(name) or not self._validate_field_name(name):
             name += '_'
-        new_name = name
-        while not (
-            new_name.isidentifier() or not self._validate_field_name(new_name)
-        ) or (excludes and new_name in excludes):
-            new_name = f'{name}_{count}'
+        new_name = snake_to_upper_camel(name) if upper_camel else name
+        while (
+            not (new_name.isidentifier() or not self._validate_field_name(new_name))
+            or iskeyword(new_name)
+            or (excludes and new_name in excludes)
+        ):
+            new_name = f'{name}{count}' if upper_camel else f'{name}_{count}'
             count += 1
         return new_name
 
@@ -182,7 +205,19 @@ class PydanticFieldNameResolver(FieldNameResolver):
 
 
 class EnumFieldNameResolver(FieldNameResolver):
-    pass
+    def get_valid_name(
+        self,
+        name: str,
+        excludes: Optional[Set[str]] = None,
+        ignore_snake_case_field: bool = False,
+        upper_camel: bool = False,
+    ) -> str:
+        return super().get_valid_name(
+            name='mro_' if name == 'mro' else name,
+            excludes=excludes,
+            ignore_snake_case_field=ignore_snake_case_field,
+            upper_camel=upper_camel,
+        )
 
 
 class ModelType(Enum):
@@ -230,6 +265,7 @@ class ModelResolver:
         field_name_resolver_classes: Optional[
             Dict[ModelType, Type[FieldNameResolver]]
         ] = None,
+        original_field_name_delimiter: Optional[str] = None,
     ) -> None:
         self.references: Dict[str, Reference] = {}
         self._current_root: Sequence[str] = []
@@ -253,6 +289,7 @@ class ModelResolver:
                 aliases=aliases,
                 snake_case_field=snake_case_field,
                 empty_field_name=empty_field_name,
+                original_delimiter=original_field_name_delimiter,
             )
             for k, v in merged_field_name_resolver_classes.items()
         }
@@ -492,8 +529,9 @@ class ModelResolver:
 
     def default_class_name_generator(self, name: str) -> str:
         # TODO: create a validate for class name
-        name = self.field_name_resolvers[ModelType.CLASS].get_valid_name(name)
-        return snake_to_upper_camel(name)
+        return self.field_name_resolvers[ModelType.CLASS].get_valid_name(
+            name, ignore_snake_case_field=True, upper_camel=True
+        )
 
     def get_class_name(
         self,
@@ -508,7 +546,9 @@ class ModelResolver:
             split_name = name.split('.')
             prefix = '.'.join(
                 # TODO: create a validate for class name
-                self.field_name_resolvers[ModelType.CLASS].get_valid_name(n)
+                self.field_name_resolvers[ModelType.CLASS].get_valid_name(
+                    n, ignore_snake_case_field=True
+                )
                 for n in split_name[:-1]
             )
             prefix += '.'
@@ -583,13 +623,13 @@ def get_singular_name(name: str, suffix: str = SINGULAR_NAME_SUFFIX) -> str:
 
 
 @lru_cache()
-def snake_to_upper_camel(word: str) -> str:
+def snake_to_upper_camel(word: str, delimiter: str = '_') -> str:
     prefix = ''
-    if word.startswith('_'):
+    if word.startswith(delimiter):
         prefix = '_'
         word = word[1:]
 
-    return prefix + ''.join(x[0].upper() + x[1:] for x in word.split('_') if x)
+    return prefix + ''.join(x[0].upper() + x[1:] for x in word.split(delimiter) if x)
 
 
 def is_url(ref: str) -> bool:
